@@ -371,4 +371,76 @@ public class FullClusterRestartLuceneIndexCompatibilityIT extends FullClusterRes
             deleteIndex(index);
         }
     }
+
+    /**
+     * Creates an index on N-2 and takes a snapshot on N-2 (without marking as read-only first),
+     * then restores the snapshot directly on N. This reproduces the scenario reported in
+     * <a href="https://github.com/elastic/elasticsearch/issues/145141">#145141</a> where restoring
+     * a 7.x snapshot on 9.x fails because the verified_read_only flag was never set.
+     */
+    public void testRestoreSnapshotCreatedOnOldVersion() throws Exception {
+        final String repository = suffix("repository");
+        final String snapshot = suffix("snapshot");
+        final String index = suffix("index");
+        final int numDocs = 1543;
+
+        if (isFullyUpgradedTo(VERSION_MINUS_2)) {
+            logger.debug("--> registering repository [{}]", repository);
+            registerRepository(client(), repository, FsRepository.TYPE, true, repositorySettings());
+
+            logger.debug("--> creating index [{}]", index);
+            createIndex(
+                client(),
+                index,
+                Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+            );
+
+            logger.debug("--> indexing [{}] docs in [{}]", numDocs, index);
+            indexDocs(index, numDocs);
+
+            logger.debug("--> creating snapshot [{}] on N-2 without read-only block", snapshot);
+            createSnapshot(client(), repository, snapshot, true);
+
+            logger.debug("--> deleting index [{}]", index);
+            deleteIndex(index);
+            return;
+        }
+
+        if (isFullyUpgradedTo(VERSION_MINUS_1)) {
+            // snapshot was already created on N-2; nothing to do on N-1
+            return;
+        }
+
+        if (isFullyUpgradedTo(VERSION_CURRENT)) {
+            var restoredIndex = suffix("index-restored-from-old");
+            logger.debug("--> restoring snapshot [{}] created on N-2 as [{}]", snapshot, restoredIndex);
+            restoreIndex(repository, snapshot, index, restoredIndex);
+            ensureGreen(restoredIndex);
+
+            assertIndexSetting(restoredIndex, VERIFIED_READ_ONLY_SETTING, is(true));
+            assertThat(indexBlocks(restoredIndex), contains(INDEX_WRITE_BLOCK));
+            assertThat(indexVersion(restoredIndex), equalTo(VERSION_MINUS_2));
+            assertDocCount(client(), restoredIndex, numDocs);
+
+            updateRandomIndexSettings(restoredIndex);
+            updateRandomMappings(restoredIndex);
+
+            logger.debug("--> adding replica to test peer-recovery");
+            updateIndexSettings(restoredIndex, Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1));
+            ensureGreen(restoredIndex);
+
+            logger.debug("--> closing restored index [{}]", restoredIndex);
+            closeIndex(restoredIndex);
+            ensureGreen(restoredIndex);
+
+            logger.debug("--> re-opening restored index [{}]", restoredIndex);
+            openIndex(restoredIndex);
+            ensureGreen(restoredIndex);
+
+            assertDocCount(client(), restoredIndex, numDocs);
+
+            logger.debug("--> deleting restored index [{}]", restoredIndex);
+            deleteIndex(restoredIndex);
+        }
+    }
 }

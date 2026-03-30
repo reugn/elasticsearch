@@ -1462,6 +1462,11 @@ public final class RestoreService implements ClusterStateApplier {
                     // adapt index metadata so that it can be understood by current version
                     snapshotIndexMetadata = convertLegacyIndex(snapshotIndexMetadata, currentState, indicesService);
                 }
+                snapshotIndexMetadata = prepareForReadOnlyRestore(
+                    snapshotIndexMetadata,
+                    minIndexCompatibilityVersion,
+                    minReadOnlyIndexCompatibilityVersion
+                );
                 try {
                     snapshotIndexMetadata = indexMetadataVerifier.verifyIndexMetadata(
                         snapshotIndexMetadata,
@@ -1796,6 +1801,39 @@ public final class RestoreService implements ClusterStateApplier {
             );
             listener.clusterStateUpdate().onResponse(new RestoreCompletionResponse(restoreUUID, snapshot, restoreInfo));
         }
+    }
+
+    /**
+     * Prepares a read-only compatible index for restoration by automatically adding the write block and marking it as
+     * verified read-only. This handles the case where a snapshot was created on an older version (e.g. 7.x) without
+     * going through the intermediate upgrade step (e.g. 8.x) that would normally set these flags via the add-block API.
+     * <p>
+     * Only applies when the index is read-only compatible (e.g. created in version N-2) but not yet marked as verified.
+     * Indices that already have the {@code verified_read_only} setting (from a proper upgrade) or that are fully
+     * compatible are left unchanged.
+     */
+    static IndexMetadata prepareForReadOnlyRestore(
+        IndexMetadata indexMetadata,
+        IndexVersion minIndexCompatibilityVersion,
+        IndexVersion minReadOnlyIndexCompatibilityVersion
+    ) {
+        if (MetadataIndexStateService.VERIFIED_READ_ONLY_SETTING.get(indexMetadata.getSettings()) == false
+            && IndexMetadataVerifier.isFullySupportedVersion(indexMetadata, minIndexCompatibilityVersion) == false
+            && IndexMetadataVerifier.isReadOnlyCompatible(
+                indexMetadata,
+                minIndexCompatibilityVersion,
+                minReadOnlyIndexCompatibilityVersion
+            )) {
+            return IndexMetadata.builder(indexMetadata)
+                .settings(
+                    Settings.builder()
+                        .put(indexMetadata.getSettings())
+                        .put(IndexMetadata.SETTING_BLOCKS_WRITE, true)
+                        .put(MetadataIndexStateService.VERIFIED_READ_ONLY_SETTING.getKey(), true)
+                )
+                .build();
+        }
+        return indexMetadata;
     }
 
     /// Converts a legacy index (created before [org.elasticsearch.index.IndexVersions#MINIMUM_READONLY_COMPATIBLE])
