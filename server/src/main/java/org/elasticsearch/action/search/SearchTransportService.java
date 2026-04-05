@@ -76,6 +76,7 @@ import org.elasticsearch.transport.TransportResponseHandler;
 import org.elasticsearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -436,6 +437,15 @@ public class SearchTransportService {
      */
     public Map<String, Long> getPendingSearchRequests() {
         return new HashMap<>(clientConnections);
+    }
+
+    /**
+     * Return a read-only live view of the pending search requests map. Unlike
+     * {@link #getPendingSearchRequests()}, this reflects concurrent dispatch activity in real
+     * time. Used by ARS probing to check actual concurrent load on stat-less nodes.
+     */
+    public Map<String, Long> getLiveClientConnections() {
+        return Collections.unmodifiableMap(clientConnections);
     }
 
     static class ScrollFreeContextRequest extends AbstractTransportRequest {

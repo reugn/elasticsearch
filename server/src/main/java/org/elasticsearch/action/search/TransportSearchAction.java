@@ -2521,14 +2521,18 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             searchRequest.routing(),
             searchRequest.indices()
         );
+        var arsContext = new OperationRouting.ArsContext(
+            responseCollectorService,
+            searchTransportService.getPendingSearchRequests(),
+            searchTransportService.getLiveClientConnections()
+        );
         List<SearchShardRouting> shardRoutings = clusterService.operationRouting()
             .searchShards(
                 projectState,
                 concreteIndices,
                 routingMap,
                 searchRequest.preference(),
-                responseCollectorService,
-                searchTransportService.getPendingSearchRequests(),
+                arsContext,
                 shouldSort
             );
         final Map<String, OriginalIndices> originalIndices = buildPerIndexOriginalIndices(

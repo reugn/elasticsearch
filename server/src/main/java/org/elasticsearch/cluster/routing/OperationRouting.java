@@ -36,6 +36,17 @@ import java.util.stream.Collectors;
 
 public class OperationRouting {
 
+    /**
+     * Bundles the state needed for adaptive replica selection (ARS) routing decisions.
+     *
+     * @param collector        collects per-node EWMA stats (queue size, response time, service time)
+     * @param snapshotCounts   mutable snapshot of in-flight counts, used by the ARS formula and
+     *                         incremented locally for multi-shard spreading within a single search
+     * @param liveCounts       read-only live view of in-flight counts, used by the probe cap to
+     *                         see real concurrent load across searches
+     */
+    public record ArsContext(ResponseCollectorService collector, Map<String, Long> snapshotCounts, Map<String, Long> liveCounts) {}
+
     public static final Setting<Boolean> USE_ADAPTIVE_REPLICA_SELECTION_SETTING = Setting.boolSetting(
         "cluster.routing.use_adaptive_replica_selection",
         true,
@@ -69,13 +80,13 @@ public class OperationRouting {
         IndexRouting indexRouting = IndexRouting.fromIndexMetadata(indexMetadata(projectState.metadata(), index));
         IndexShardRoutingTable shards = projectState.routingTable().shardRoutingTable(index, indexRouting.getShard(id, routing));
         DiscoveryNodes nodes = projectState.cluster().nodes();
-        return preferenceActiveShardIterator(shards, nodes.getLocalNodeId(), nodes, preference, null, null);
+        return preferenceActiveShardIterator(shards, nodes.getLocalNodeId(), nodes, preference, null);
     }
 
     public ShardIterator getShards(ProjectState projectState, String index, int shardId, @Nullable String preference) {
         IndexShardRoutingTable indexShard = projectState.routingTable().shardRoutingTable(index, shardId);
         DiscoveryNodes nodes = projectState.cluster().nodes();
-        return preferenceActiveShardIterator(indexShard, nodes.getLocalNodeId(), nodes, preference, null, null);
+        return preferenceActiveShardIterator(indexShard, nodes.getLocalNodeId(), nodes, preference, null);
     }
 
     public List<SearchShardRouting> searchShards(
@@ -84,7 +95,7 @@ public class OperationRouting {
         @Nullable Map<String, Set<String>> routing,
         @Nullable String preference
     ) {
-        return searchShards(projectState, concreteIndices, routing, preference, null, null, true);
+        return searchShards(projectState, concreteIndices, routing, preference, null, true);
     }
 
     public List<SearchShardRouting> searchShards(
@@ -92,8 +103,7 @@ public class OperationRouting {
         String[] concreteIndices,
         @Nullable Map<String, Set<String>> routing,
         @Nullable String preference,
-        @Nullable ResponseCollectorService collectorService,
-        @Nullable Map<String, Long> nodeCounts,
+        @Nullable ArsContext arsContext,
         boolean shouldSort
     ) {
         final Set<SearchTargetShard> shards = computeTargetedShards(projectState, concreteIndices, routing);
@@ -105,8 +115,7 @@ public class OperationRouting {
                 nodes.getLocalNodeId(),
                 nodes,
                 preference,
-                collectorService,
-                nodeCounts
+                arsContext
             );
             if (iterator != null) {
                 res.add(
@@ -247,11 +256,10 @@ public class OperationRouting {
         String localNodeId,
         DiscoveryNodes nodes,
         @Nullable String preference,
-        @Nullable ResponseCollectorService collectorService,
-        @Nullable Map<String, Long> nodeCounts
+        @Nullable ArsContext arsContext
     ) {
         if (preference == null || preference.isEmpty()) {
-            return shardRoutings(indexShard, collectorService, nodeCounts);
+            return shardRoutings(indexShard, arsContext);
         }
         if (preference.charAt(0) == '_') {
             Preference preferenceType = Preference.parse(preference);
@@ -278,7 +286,7 @@ public class OperationRouting {
                 }
                 // no more preference
                 if (index == -1 || index == preference.length() - 1) {
-                    return shardRoutings(indexShard, collectorService, nodeCounts);
+                    return shardRoutings(indexShard, arsContext);
                 } else {
                     // update the preference and continue
                     preference = preference.substring(index + 1);
@@ -309,16 +317,11 @@ public class OperationRouting {
         return indexShard.activeInitializingShardsIt(routingHash);
     }
 
-    private ShardIterator shardRoutings(
-        IndexShardRoutingTable indexShard,
-        @Nullable ResponseCollectorService collectorService,
-        @Nullable Map<String, Long> nodeCounts
-    ) {
+    private ShardIterator shardRoutings(IndexShardRoutingTable indexShard, @Nullable ArsContext arsContext) {
         if (useAdaptiveReplicaSelection) {
-            return indexShard.activeInitializingShardsRankedIt(collectorService, nodeCounts);
-        } else {
-            return indexShard.activeInitializingShardsRandomIt();
+            return indexShard.activeInitializingShardsRankedIt(arsContext);
         }
+        return indexShard.activeInitializingShardsRandomIt();
     }
 
     protected static IndexRoutingTable indexRoutingTable(RoutingTable routingTable, String index) {

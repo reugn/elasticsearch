@@ -18,7 +18,6 @@ import org.elasticsearch.node.ResponseCollectorService;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.TestThreadPool;
 
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,10 +26,11 @@ import java.util.Optional;
 public class IndexShardRoutingTableTests extends ESTestCase {
 
     /**
-     * Stat-less nodes below the in-flight cap are probed (assigned {@code nextDown(bestRank)}).
-     * Nodes at or above the cap get no rank entry and sort last via nullsLast.
+     * The probe cap checks the live in-flight map, not the snapshot. Stat-less nodes below the
+     * live cap are probed (assigned {@code nextDown(bestRank)}). Nodes at or above the live cap
+     * get no rank entry and sort last via nullsLast.
      */
-    public void testRankNodesWithoutStatsUsesInflightForProbing() {
+    public void testRankNodesProbeCapUsesLiveInflightCounts() {
         TestThreadPool threadPool = new TestThreadPool("test");
         try {
             ClusterService clusterService = new ClusterService(
@@ -48,31 +48,33 @@ public class IndexShardRoutingTableTests extends ESTestCase {
             nodeStats.put("node2", collector.getNodeStatistics("node2"));
             nodeStats.put("node3", Optional.empty());
 
-            Map<String, Long> searchCounts = new HashMap<>();
-            searchCounts.put("node1", 5L);
-            searchCounts.put("node2", 3L);
+            // Snapshot used by ARS formula — node3 has 0 inflight here
+            Map<String, Long> snapshot = new HashMap<>();
+            snapshot.put("node1", 5L);
+            snapshot.put("node2", 3L);
 
-            double r1 = nodeStats.get("node1").get().rank(searchCounts.get("node1"));
-            double r2 = nodeStats.get("node2").get().rank(searchCounts.get("node2"));
+            double r1 = nodeStats.get("node1").get().rank(snapshot.get("node1"));
+            double r2 = nodeStats.get("node2").get().rank(snapshot.get("node2"));
             double bestRank = Math.min(r1, r2);
             double expectedProbe = Math.nextDown(bestRank);
 
-            long cap = 3; // small cap for easy testing
+            long cap = 3;
 
-            // node3 has 0 inflight (below cap) → should be probed
-            Map<String, Double> ranks = IndexShardRoutingTable.rankNodes(nodeStats, searchCounts, cap);
+            // Live map shows node3 at 0 inflight → probed
+            Map<String, Long> live = new HashMap<>();
+            Map<String, Double> ranks = IndexShardRoutingTable.rankNodes(nodeStats, snapshot, live, cap);
             assertEquals(r1, ranks.get("node1"), 0.0);
             assertEquals(r2, ranks.get("node2"), 0.0);
             assertEquals(expectedProbe, ranks.get("node3"), 0.0);
 
-            // node3 has inflight below cap → still probed
-            searchCounts.put("node3", cap - 1);
-            ranks = IndexShardRoutingTable.rankNodes(nodeStats, searchCounts, cap);
+            // Live map shows node3 below cap → still probed
+            live.put("node3", cap - 1);
+            ranks = IndexShardRoutingTable.rankNodes(nodeStats, snapshot, live, cap);
             assertEquals(expectedProbe, ranks.get("node3"), 0.0);
 
-            // node3 at cap → should NOT be probed (no rank entry)
-            searchCounts.put("node3", cap);
-            ranks = IndexShardRoutingTable.rankNodes(nodeStats, searchCounts, cap);
+            // Live map shows node3 at cap → NOT probed, even though snapshot still shows 0
+            live.put("node3", cap);
+            ranks = IndexShardRoutingTable.rankNodes(nodeStats, snapshot, live, cap);
             assertNull(ranks.get("node3"));
         } finally {
             terminate(threadPool);
@@ -80,8 +82,8 @@ public class IndexShardRoutingTableTests extends ESTestCase {
     }
 
     public void testEqualsAttributesKey() {
-        List<String> attr1 = Arrays.asList("a");
-        List<String> attr2 = Arrays.asList("b");
+        List<String> attr1 = List.of("a");
+        List<String> attr2 = List.of("b");
         IndexShardRoutingTable.AttributesKey attributesKey1 = new IndexShardRoutingTable.AttributesKey(attr1);
         IndexShardRoutingTable.AttributesKey attributesKey2 = new IndexShardRoutingTable.AttributesKey(attr1);
         IndexShardRoutingTable.AttributesKey attributesKey3 = new IndexShardRoutingTable.AttributesKey(attr2);

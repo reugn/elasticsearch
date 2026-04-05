@@ -9,9 +9,11 @@
 
 package org.elasticsearch.search.routing;
 
+import org.elasticsearch.action.ActionFuture;
 import org.elasticsearch.action.admin.cluster.node.stats.NodeStats;
 import org.elasticsearch.action.admin.cluster.node.stats.NodesStatsResponse;
 import org.elasticsearch.action.admin.cluster.state.ClusterStateResponse;
+import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.node.DiscoveryNode;
@@ -19,15 +21,19 @@ import org.elasticsearch.cluster.routing.OperationRouting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.test.ESIntegTestCase;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.elasticsearch.index.query.QueryBuilders.matchAllQuery;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponse;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponses;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 
 @ESIntegTestCase.ClusterScope(numClientNodes = 1, numDataNodes = 3)
@@ -153,5 +159,78 @@ public class SearchReplicaSelectionIT extends ESIntegTestCase {
             // PROBE_INFLIGHT_CAP is 8 when the ars_probing feature flag is enabled
             assertThat("new node should not win more shards than the probe cap", newNodeShards, lessThanOrEqualTo(8L));
         });
+    }
+
+    /**
+     * Verifies that under a burst of concurrent searches, the live in-flight counter prevents
+     * a new stat-less node from receiving all the traffic. This tests the cross-search probe cap
+     * using the live clientConnections map from SearchTransportService.
+     */
+    public void testConcurrentBurstDoesNotFloodNewNode() {
+        Client client = internalCluster().coordOnlyNodeClient();
+
+        // Single-shard index so each search routes to exactly one node — isolates the
+        // cross-search live counter behavior without multi-shard spreading effects
+        client.admin().indices().prepareCreate("burst_test").setSettings(indexSettings(1, 2)).get();
+        ensureGreen("burst_test");
+
+        client.prepareIndex("burst_test").setSource("field", "value").get();
+        refresh("burst_test");
+
+        // Build ARS stats on the existing 3 nodes
+        for (int i = 0; i < 30; i++) {
+            client.prepareSearch("burst_test").setQuery(matchAllQuery()).get().decRef();
+        }
+
+        // Add a 4th data node
+        String newNode = internalCluster().startDataOnlyNode(
+            Settings.builder().put(OperationRouting.USE_ADAPTIVE_REPLICA_SELECTION_SETTING.getKey(), true).build()
+        );
+        updateIndexSettings(Settings.builder().put(IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 3), "burst_test");
+        ensureGreen("burst_test");
+
+        // Find the new node's ID
+        ClusterStateResponse clusterState = client.admin().cluster().prepareState(TEST_REQUEST_TIMEOUT).get();
+        String newNodeId = null;
+        for (Map.Entry<String, DiscoveryNode> entry : clusterState.getState().nodes().getDataNodes().entrySet()) {
+            if (entry.getValue().getName().equals(newNode)) {
+                newNodeId = entry.getKey();
+                break;
+            }
+        }
+        assertNotNull("new node should be in cluster state", newNodeId);
+
+        // Fire a burst of concurrent searches — dispatch all before waiting for any response.
+        // This simulates the real-world scenario where many searches arrive simultaneously
+        // and should be bounded by the live in-flight counter.
+        int burstSize = 50;
+        List<ActionFuture<SearchResponse>> futures = new ArrayList<>(burstSize);
+        for (int i = 0; i < burstSize; i++) {
+            futures.add(client.prepareSearch("burst_test").setQuery(matchAllQuery()).execute());
+        }
+
+        // Collect results and count how many went to the new node
+        AtomicInteger newNodeHits = new AtomicInteger();
+        final String targetNodeId = newNodeId;
+        for (ActionFuture<SearchResponse> future : futures) {
+            SearchResponse response = future.actionGet();
+            try {
+                if (response.getHits().getHits().length > 0 && targetNodeId.equals(response.getHits().getAt(0).getShard().getNodeId())) {
+                    newNodeHits.incrementAndGet();
+                }
+            } finally {
+                response.decRef();
+            }
+        }
+
+        // The new node should not receive the majority of the traffic.
+        // With the live counter, concurrent searches see each other's dispatches and the
+        // probe cap bounds how many can target the new node. The exact number depends on
+        // thread timing, but it should be significantly less than the total burst.
+        assertThat(
+            "new node should not receive majority of concurrent burst traffic (got " + newNodeHits.get() + "/" + burstSize + ")",
+            newNodeHits.get(),
+            lessThan(burstSize / 2)
+        );
     }
 }

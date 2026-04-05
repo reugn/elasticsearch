@@ -243,20 +243,18 @@ public class IndexShardRoutingTable {
      * selection formula. Making sure though that its random within the active shards of the same
      * (or missing) rank, and initializing shards are the last to iterate through.
      */
-    public ShardIterator activeInitializingShardsRankedIt(
-        @Nullable ResponseCollectorService collector,
-        @Nullable Map<String, Long> nodeSearchCounts
-    ) {
+    public ShardIterator activeInitializingShardsRankedIt(@Nullable OperationRouting.ArsContext arsContext) {
+        if (arsContext == null) {
+            return activeInitializingShardsRandomIt();
+        }
         final int seed = shuffler.nextSeed();
         if (allInitializingShards.isEmpty()) {
-            return new ShardIterator(shardId, rankShardsAndUpdateStats(shuffler.shuffle(activeShards, seed), collector, nodeSearchCounts));
+            return new ShardIterator(shardId, rankShardsAndUpdateStats(shuffler.shuffle(activeShards, seed), arsContext));
         }
 
         ArrayList<ShardRouting> ordered = new ArrayList<>(activeShards.size() + allInitializingShards.size());
-        List<ShardRouting> rankedActiveShards = rankShardsAndUpdateStats(shuffler.shuffle(activeShards, seed), collector, nodeSearchCounts);
-        ordered.addAll(rankedActiveShards);
-        List<ShardRouting> rankedInitializingShards = rankShardsAndUpdateStats(allInitializingShards, collector, nodeSearchCounts);
-        ordered.addAll(rankedInitializingShards);
+        ordered.addAll(rankShardsAndUpdateStats(shuffler.shuffle(activeShards, seed), arsContext));
+        ordered.addAll(rankShardsAndUpdateStats(allInitializingShards, arsContext));
         return new ShardIterator(shardId, ordered);
     }
 
@@ -298,20 +296,22 @@ public class IndexShardRoutingTable {
      * Computes a rank for each node based on its adaptive replica selection (ARS) stats.
      * Nodes with stats are ranked using the C3 formula via {@link ResponseCollectorService.ComputedNodeStats#rank}.
      * Nodes without stats (e.g. newly joined) are assigned {@code Math.nextDown(bestRank)} so they
-     * are probed ahead of measured nodes, but only while their in-flight request count stays below
-     * {@code probeInflightCap}. Once at the cap they receive no rank entry, causing the
-     * {@link NodeRankComparator} (nulls-last) to sort them after all ranked nodes.
+     * are probed ahead of measured nodes, but only while their in-flight request count stays
+     * below {@code probeInflightCap}. The cap checks the maximum of the live count (real-time
+     * concurrent load across searches) and the snapshot count (within-search shard wins).
      *
      * @param nodeStats        per-node EWMA stats; {@code Optional.empty()} for nodes without stats
-     * @param nodeSearchCounts per-node count of in-flight (outstanding) search requests on the
-     *                         coordinating node, captured from {@code TransportSearchAction}
+     * @param snapshotCounts   mutable snapshot of in-flight counts used by the ARS formula and
+     *                         local multi-shard spreading
+     * @param liveCounts       live (real-time) in-flight counts for the probe cap check
      * @param probeInflightCap maximum number of concurrent in-flight requests to a stat-less node
      *                         before it stops being probed
      * @return map of node ID to computed rank; nodes above the probe cap with no stats are absent
      */
     static Map<String, Double> rankNodes(
         final Map<String, Optional<ResponseCollectorService.ComputedNodeStats>> nodeStats,
-        final Map<String, Long> nodeSearchCounts,
+        final Map<String, Long> snapshotCounts,
+        final Map<String, Long> liveCounts,
         final long probeInflightCap
     ) {
         final Map<String, Double> nodeRanks = Maps.newMapWithExpectedSize(nodeStats.size());
@@ -321,15 +321,18 @@ public class IndexShardRoutingTable {
             Optional<ResponseCollectorService.ComputedNodeStats> maybeStats = entry.getValue();
             if (maybeStats.isPresent()) {
                 final String nodeId = entry.getKey();
-                double rank = maybeStats.get().rank(nodeSearchCounts.getOrDefault(nodeId, 0L));
+                double rank = maybeStats.get().rank(snapshotCounts.getOrDefault(nodeId, 0L));
                 nodeRanks.put(nodeId, rank);
                 if (rank < bestRank) {
                     bestRank = rank;
                 }
             } else {
                 final String nodeId = entry.getKey();
-                if (nodeSearchCounts.getOrDefault(nodeId, 0L) < probeInflightCap) {
-                    // No stats and below the in-flight cap — candidate for probing
+                // Check snapshot first (cheap HashMap read) — if already at cap from
+                // within-search shard wins, skip the live map lookup (volatile ConcurrentHashMap read).
+                long snapshotCount = snapshotCounts.getOrDefault(nodeId, 0L);
+                if (snapshotCount < probeInflightCap && liveCounts.getOrDefault(nodeId, 0L) < probeInflightCap) {
+                    // No stats and below both caps — candidate for probing
                     if (probeCandidates == null) {
                         probeCandidates = new ArrayList<>();
                     }
@@ -388,12 +391,11 @@ public class IndexShardRoutingTable {
         }
     }
 
-    private static List<ShardRouting> rankShardsAndUpdateStats(
-        List<ShardRouting> shards,
-        final ResponseCollectorService collector,
-        final Map<String, Long> nodeSearchCounts
-    ) {
-        if (collector == null || nodeSearchCounts == null || shards.size() <= 1) {
+    private static List<ShardRouting> rankShardsAndUpdateStats(List<ShardRouting> shards, final OperationRouting.ArsContext arsContext) {
+        final ResponseCollectorService collector = arsContext.collector();
+        final Map<String, Long> snapshotCounts = arsContext.snapshotCounts();
+        final Map<String, Long> liveCounts = arsContext.liveCounts();
+        if (collector == null || snapshotCounts == null || shards.size() <= 1) {
             return shards;
         }
 
@@ -402,9 +404,10 @@ public class IndexShardRoutingTable {
 
         // sort all shards based on the shard rank
         ArrayList<ShardRouting> sortedShards = new ArrayList<>(shards);
-        sortedShards.sort(new NodeRankComparator(rankNodes(nodeStats, nodeSearchCounts, PROBE_INFLIGHT_CAP)));
+        sortedShards.sort(new NodeRankComparator(rankNodes(nodeStats, snapshotCounts, liveCounts, PROBE_INFLIGHT_CAP)));
 
-        // adjust the non-winner nodes' stats so they will get a chance to receive queries
+        // Blend the winner's stats into non-winner nodes so their stale EWMA values
+        // gradually converge toward the winner's, preventing permanent starvation.
         ShardRouting minShard = sortedShards.get(0);
         // If the winning shard is not started we are ranking initializing
         // shards, don't bother to do adjustments
@@ -412,11 +415,11 @@ public class IndexShardRoutingTable {
             String minNodeId = minShard.currentNodeId();
             // Increase the number of searches for the "winning" node by one.
             // Note that this doesn't actually affect the "real" counts, instead
-            // it only affects the captured node search counts, which is
-            // captured once for each query in TransportSearchAction.
-            // This must happen outside the stats check so that stat-less probe winners
-            // also increment the count, making the probe cap effective for multi-shard indices.
-            nodeSearchCounts.compute(minNodeId, (id, conns) -> conns == null ? 1 : conns + 1);
+            // it only affects the snapshot, which is shared across shards within
+            // one search for multi-shard spreading. This must happen outside the
+            // stats check so that stat-less probe winners also increment the count,
+            // making the probe cap effective for multi-shard indices.
+            snapshotCounts.compute(minNodeId, (id, conns) -> conns == null ? 1 : conns + 1);
             Optional<ResponseCollectorService.ComputedNodeStats> maybeMinStats = nodeStats.get(minNodeId);
             if (maybeMinStats.isPresent()) {
                 adjustStats(collector, nodeStats, minNodeId, maybeMinStats.get());
