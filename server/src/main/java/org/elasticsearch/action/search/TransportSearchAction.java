@@ -2527,14 +2527,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             searchTransportService.getLiveClientConnections()
         );
         List<SearchShardRouting> shardRoutings = clusterService.operationRouting()
-            .searchShards(
-                projectState,
-                concreteIndices,
-                routingMap,
-                searchRequest.preference(),
-                arsContext,
-                shouldSort
-            );
+            .searchShards(projectState, concreteIndices, routingMap, searchRequest.preference(), arsContext, shouldSort);
         final Map<String, OriginalIndices> originalIndices = buildPerIndexOriginalIndices(
             projectState,
             indicesAndAliases,
