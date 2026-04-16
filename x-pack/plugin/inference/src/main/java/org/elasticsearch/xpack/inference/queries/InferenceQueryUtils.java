@@ -116,6 +116,29 @@ public final class InferenceQueryUtils {
     private InferenceQueryUtils() {}
 
     /**
+     * Checks whether any local resolved index has an inference field matching the given concrete field name.
+     * This is used by query rewrite interceptors to short-circuit interception for queries that do not
+     * target semantic_text fields, avoiding unnecessary wrapping and cross-cluster roundtrips.
+     *
+     * @param context the query rewrite context
+     * @param fieldName the concrete field name to check (no wildcards)
+     * @return {@code true} if at least one local index has a matching inference field
+     */
+    public static boolean hasLocalInferenceField(QueryRewriteContext context, String fieldName) {
+        ResolvedIndices resolvedIndices = context.getResolvedIndices();
+        if (resolvedIndices == null) {
+            // No resolved indices available — we can't determine field types, so intercept to be safe
+            return true;
+        }
+        for (IndexMetadata indexMetadata : resolvedIndices.getConcreteLocalIndicesMetadata().values()) {
+            if (indexMetadata.getInferenceFields().containsKey(fieldName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * <p>
      * Get inference info for the queried local and remote indices.
      * </p>

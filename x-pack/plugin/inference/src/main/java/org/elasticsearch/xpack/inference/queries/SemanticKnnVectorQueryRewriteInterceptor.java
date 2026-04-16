@@ -26,6 +26,9 @@ public class SemanticKnnVectorQueryRewriteInterceptor implements QueryRewriteInt
     @Override
     public QueryBuilder interceptAndRewrite(QueryRewriteContext context, QueryBuilder queryBuilder) throws IOException {
         if (queryBuilder instanceof KnnVectorQueryBuilder knnVectorQueryBuilder) {
+            if (InferenceQueryUtils.hasLocalInferenceField(context, knnVectorQueryBuilder.getFieldName()) == false) {
+                return queryBuilder;
+            }
             return interceptKnnQuery(context, knnVectorQueryBuilder);
         } else {
             throw new IllegalStateException("Unexpected query builder type: " + queryBuilder.getClass());

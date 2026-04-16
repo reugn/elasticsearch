@@ -16,6 +16,9 @@ public class SemanticSparseVectorQueryRewriteInterceptor implements QueryRewrite
     @Override
     public QueryBuilder interceptAndRewrite(QueryRewriteContext context, QueryBuilder queryBuilder) {
         if (queryBuilder instanceof SparseVectorQueryBuilder sparseVectorQueryBuilder) {
+            if (InferenceQueryUtils.hasLocalInferenceField(context, sparseVectorQueryBuilder.getFieldName()) == false) {
+                return queryBuilder;
+            }
             return new InterceptedInferenceSparseVectorQueryBuilder(sparseVectorQueryBuilder);
         } else {
             throw new IllegalStateException("Unexpected query builder type: " + queryBuilder.getClass());

@@ -16,6 +16,9 @@ public class SemanticMatchQueryRewriteInterceptor implements QueryRewriteInterce
     @Override
     public QueryBuilder interceptAndRewrite(QueryRewriteContext context, QueryBuilder queryBuilder) {
         if (queryBuilder instanceof MatchQueryBuilder matchQueryBuilder) {
+            if (InferenceQueryUtils.hasLocalInferenceField(context, matchQueryBuilder.fieldName()) == false) {
+                return queryBuilder;
+            }
             return new InterceptedInferenceMatchQueryBuilder(matchQueryBuilder);
         } else {
             throw new IllegalStateException("Unexpected query builder type: " + queryBuilder.getClass());
