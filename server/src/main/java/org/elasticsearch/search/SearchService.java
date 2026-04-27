@@ -614,16 +614,37 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         // this is important to ensure store can be cleaned up, in particular if the search is a scroll with a long timeout.
         final Index index = context.indexShard().shardId().getIndex();
         if (indicesService.hasIndex(index) == false) {
-            removeReaderContext(context.id());
+            removeReaderContext(context.id(), "index not found during putReaderContext");
             throw new IndexNotFoundException(index);
         }
     }
 
     protected ReaderContext removeReaderContext(ShardSearchContextId id) {
+        return removeReaderContext(id, null);
+    }
+
+    private ReaderContext removeReaderContext(ShardSearchContextId id, String reason) {
+        final ReaderContext removed = activeReaders.remove(id);
         if (logger.isTraceEnabled()) {
-            logger.trace("removing reader context [{}]", id);
+            logger.trace(
+                "removing reader context [{}] kind [{}] reason [{}]",
+                id,
+                removed != null ? contextKind(removed) : "unknown",
+                reason != null ? reason : "n/a"
+            );
         }
-        return activeReaders.remove(id);
+        return removed;
+    }
+
+    /**
+     * Returns a short string describing the kind of a reader context for diagnostic logging:
+     * {@code scroll}, {@code pit}, or {@code single} (single-shot query/fetch).
+     */
+    private static String contextKind(ReaderContext context) {
+        if (context.scrollContext() != null) {
+            return "scroll";
+        }
+        return context.singleSession() ? "single" : "pit";
     }
 
     @Override
@@ -632,7 +653,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     @Override
     protected void doStop() {
         for (final ReaderContext context : activeReaders.values()) {
-            freeReaderContext(context.id());
+            freeReaderContext(context.id(), "search service stopping");
         }
     }
 
@@ -988,7 +1009,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             try {
                 loadOrExecuteQueryPhase(request, context);
                 if (context.queryResult().hasSearchContext() == false && readerContext.singleSession()) {
-                    freeReaderContext(readerContext.id());
+                    freeReaderContext(readerContext.id(), "query phase produced no search context (single session)");
                 }
                 afterQueryTime = System.nanoTime();
                 opsListener.onQueryPhase(context, afterQueryTime - beforeQueryTime);
@@ -1077,7 +1098,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             opsListener.onPreFetchPhase(context);
             fetchPhase.execute(context, shortcutDocIdsToLoad(context), null);
             if (reader.singleSession()) {
-                freeReaderContext(reader.id());
+                freeReaderContext(reader.id(), "fetch phase complete (single session)");
             }
             opsListener.onFetchPhase(context, System.nanoTime() - afterQueryTime);
             opsListener = null;
@@ -1143,7 +1164,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             private volatile SearchContext searchContext;
 
             private final Releasable closeOnce = Releasables.releaseOnce(Releasables.wrap(() -> {
-                if (readerContext.singleSession()) freeReaderContext(request.contextId());
+                if (readerContext.singleSession()) freeReaderContext(request.contextId(), "fetch phase finalize (single session)");
             }, () -> Releasables.close(searchContext), markAsUsed));
 
             @Override
@@ -1250,7 +1271,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             markAsUsed = readerContext.markAsUsed(getScrollKeepAlive(request.scroll()));
         } catch (Exception e) {
             // We need to release the reader context of the scroll when we hit any exception (here the keep_alive can be too large)
-            freeReaderContext(readerContext.id());
+            freeReaderContext(readerContext.id(), "scroll query phase keep-alive markAsUsed failed: " + e.getClass().getSimpleName());
             throw e;
         }
         Executor executor = getExecutor(readerContext.indexShard());
@@ -1325,7 +1346,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
                         queryResult = searchContext.queryResult();
                         if (queryResult.hasSearchContext() == false && readerContext.singleSession()) {
                             // no hits, we can release the context since there will be no fetch phase
-                            freeReaderContext(readerContext.id());
+                            freeReaderContext(readerContext.id(), "query phase produced no hits (single session)");
                         }
                         opsListener.onQueryPhase(searchContext, System.nanoTime() - before);
                         opsListener = null;
@@ -1379,7 +1400,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             markAsUsed = readerContext.markAsUsed(getScrollKeepAlive(request.scroll()));
         } catch (Exception e) {
             // We need to release the reader context of the scroll when we hit any exception (here the keep_alive can be too large)
-            freeReaderContext(readerContext.id());
+            freeReaderContext(readerContext.id(), "scroll fetch phase keep-alive markAsUsed failed: " + e.getClass().getSimpleName());
             throw e;
         }
 
@@ -1573,7 +1594,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         activeReaders.putRelocatedReader(mappingKey, context);
         final Index index = context.indexShard().shardId().getIndex();
         if (indicesService.hasIndex(index) == false) {
-            removeReaderContext(context.id());
+            removeReaderContext(context.id(), "index not found during putRelocatedReaderContext");
             throw new IndexNotFoundException(index);
         }
     }
@@ -1731,7 +1752,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         assert index != null;
         for (ReaderContext ctx : activeReaders.values()) {
             if (index.equals(ctx.indexShard().shardId().getIndex())) {
-                freeReaderContext(ctx.id());
+                freeReaderContext(ctx.id(), "index removed: " + index.getName());
             }
         }
     }
@@ -1740,14 +1761,17 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         assert shardId != null;
         for (ReaderContext ctx : activeReaders.values()) {
             if (shardId.equals(ctx.indexShard().shardId())) {
-                freeReaderContext(ctx.id());
+                freeReaderContext(ctx.id(), "shard removed: " + shardId);
             }
         }
     }
 
     public boolean freeReaderContext(ShardSearchContextId contextId) {
-        logger.trace("freeing reader context [{}]", contextId);
-        try (ReaderContext context = removeReaderContext(contextId)) {
+        return freeReaderContext(contextId, "explicit free request");
+    }
+
+    private boolean freeReaderContext(ShardSearchContextId contextId, String reason) {
+        try (ReaderContext context = removeReaderContext(contextId, reason)) {
             return context != null;
         }
     }
@@ -1755,7 +1779,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     public void freeAllScrollContexts() {
         for (ReaderContext readerContext : activeReaders.values()) {
             if (readerContext.scrollContext() != null) {
-                freeReaderContext(readerContext.id());
+                freeReaderContext(readerContext.id(), "free all scroll contexts");
             }
         }
     }
@@ -1885,7 +1909,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     private void processFailure(ReaderContext context, Exception exc) {
         if (context.singleSession() || isScrollContext(context)) {
             // we release the reader on failure if the request is a normal search or a scroll
-            freeReaderContext(context.id());
+            freeReaderContext(context.id(), "search execution failure: " + exc.getClass().getSimpleName());
         }
         try {
             if (Lucene.isCorruptionException(exc)) {
@@ -2232,8 +2256,14 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
                 && ThreadPool.assertNotScheduleThread("closing contexts may do IO, e.g. deleting dangling files");
             for (ReaderContext context : activeReaders.values()) {
                 if (context.isExpired()) {
-                    logger.debug("freeing search context [{}]", context.id());
-                    freeReaderContext(context.id());
+                    if (logger.isDebugEnabled()) {
+                        logger.debug(
+                            "freeing search context [{}] kind [{}] reason [keep-alive expired]",
+                            context.id(),
+                            contextKind(context)
+                        );
+                    }
+                    freeReaderContext(context.id(), "keep-alive expired");
                 }
             }
         }
