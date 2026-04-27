@@ -621,11 +621,11 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     }
 
     protected ReaderContext removeReaderContext(ShardSearchContextId id) {
-        return removeReaderContext(id, null);
+        return activeReaders.remove(id);
     }
 
     private ReaderContext removeReaderContext(ShardSearchContextId id, String reason) {
-        final ReaderContext removed = activeReaders.remove(id);
+        final ReaderContext removed = removeReaderContext(id);
         if (logger.isTraceEnabled()) {
             logger.trace(
                 "removing reader context [{}] kind [{}] creator_task [{}] reason [{}]",
