@@ -1180,7 +1180,8 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         FetchPhaseResponseChunk.Writer writer,
         ActionListener<FetchSearchResult> listener
     ) {
-        getExecutor(readerContext.indexShard()).execute(new AbstractRunnable() {
+        final Executor searchExecutor = getExecutor(readerContext.indexShard());
+        searchExecutor.execute(new AbstractRunnable() {
             private volatile SearchContext searchContext;
 
             private final Releasable closeOnce = Releasables.releaseOnce(Releasables.wrap(() -> {
@@ -1210,6 +1211,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
                         null,
                         writer,
                         fetchPhaseMaxInFlightChunks,
+                        searchExecutor,
                         newFetchBuildListener(opsListener, searchContext, startTime, closeOnce),
                         newFetchCompletionListener(listener, fetchResult)
                     );
