@@ -70,6 +70,7 @@ public final class ResponseCollectorService implements ClusterStateListener {
                 ns.queueSize.addValue((double) queueSize);
                 ns.responseTime.addValue((double) responseTimeNanos);
                 ns.serviceTime = avgServiceTimeNanos;
+                ns.observationCount++;
                 return ns;
             }
         });
@@ -115,13 +116,35 @@ public final class ResponseCollectorService implements ClusterStateListener {
         public final int queueSize;
         public final double responseTime;
         public final double serviceTime;
+        /**
+         * Number of EWMA observations that have been folded into this coordinator's view of the
+         * node. Read by {@code IndexShardRoutingTable#rankNodes} to decide whether the node is
+         * warm enough to anchor warming-up peers against, or still in its post-probe warmup
+         * window. Stored as {@code long} so the unbounded counter cannot overflow in practice
+         * (would take centuries even at extreme request rates). Not serialized — only meaningful
+         * on the coordinator that produced this snapshot, so wire-deserialized instances default
+         * to {@code 0} (which the routing caller treats as "still warming up").
+         */
+        public final long observationCount;
 
         public ComputedNodeStats(String nodeId, int clientNum, int queueSize, double responseTime, double serviceTime) {
+            this(nodeId, clientNum, queueSize, responseTime, serviceTime, 0L);
+        }
+
+        public ComputedNodeStats(
+            String nodeId,
+            int clientNum,
+            int queueSize,
+            double responseTime,
+            double serviceTime,
+            long observationCount
+        ) {
             this.nodeId = nodeId;
             this.clientNum = clientNum;
             this.queueSize = queueSize;
             this.responseTime = responseTime;
             this.serviceTime = serviceTime;
+            this.observationCount = observationCount;
         }
 
         ComputedNodeStats(int clientNum, NodeStatistics nodeStats) {
@@ -130,7 +153,8 @@ public final class ResponseCollectorService implements ClusterStateListener {
                 clientNum,
                 (int) nodeStats.queueSize.getAverage(),
                 nodeStats.responseTime.getAverage(),
-                nodeStats.serviceTime
+                nodeStats.serviceTime,
+                nodeStats.observationCount
             );
         }
 
@@ -140,6 +164,7 @@ public final class ResponseCollectorService implements ClusterStateListener {
             this.queueSize = in.readInt();
             this.responseTime = in.readDouble();
             this.serviceTime = in.readDouble();
+            this.observationCount = 0L;
         }
 
         @Override
@@ -214,6 +239,7 @@ public final class ResponseCollectorService implements ClusterStateListener {
         final ExponentiallyWeightedMovingAverage queueSize;
         final ExponentiallyWeightedMovingAverage responseTime;
         double serviceTime;
+        long observationCount;
 
         NodeStatistics(
             String nodeId,
@@ -225,6 +251,7 @@ public final class ResponseCollectorService implements ClusterStateListener {
             this.queueSize = queueSizeEWMA;
             this.responseTime = responseTimeEWMA;
             this.serviceTime = serviceTimeEWMA;
+            this.observationCount = 1L;
         }
     }
 }

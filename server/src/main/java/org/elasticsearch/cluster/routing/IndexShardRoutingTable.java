@@ -290,70 +290,125 @@ public class IndexShardRoutingTable {
      * while the node builds EWMA stats from its first completed requests. Set to 0 (disabled)
      * when the feature flag is off.
      */
-    static final long PROBE_INFLIGHT_CAP = ARS_PROBING_FEATURE_FLAG.isEnabled() ? 8 : 0;
+    static final long PROBE_INFLIGHT_CAP = ARS_PROBING_FEATURE_FLAG.isEnabled() ? 50 : 0;
 
     /**
      * Computes a rank for each node based on its adaptive replica selection (ARS) stats.
      * Nodes with stats are ranked using the C3 formula via {@link ResponseCollectorService.ComputedNodeStats#rank}.
      * Nodes without stats (e.g. newly joined) are assigned {@code Math.nextDown(bestRank)} so they
      * are probed ahead of measured nodes, but only while their in-flight request count stays
-     * below {@code probeInflightCap}. The cap checks the maximum of the live count (real-time
-     * concurrent load across searches) and the snapshot count (within-search shard wins).
+     * below {@code probeInflightCap}. The cap is enforced against both counts independently — a
+     * node is gated if either the snapshot count (within-search shard wins) or the live count
+     * (real-time concurrent load across searches) reaches the cap.
+     * <p>
+     * When {@code warmupSamples > 0}, a peer is considered <em>warm</em> once its
+     * {@link ResponseCollectorService.ComputedNodeStats#observationCount} reaches the threshold;
+     * below the threshold it is <em>warming up</em>. Two protections apply during warmup:
+     * <ul>
+     *   <li><b>Inflight cap</b>: the same {@code probeInflightCap} that gates stat-less probing
+     *       continues to apply to warming-up peers — at-or-above the cap they get no rank entry
+     *       and sort last via {@code nullsLast}, so a sudden burst can never put more than
+     *       {@code probeInflightCap} concurrent requests on a node before it has graduated.</li>
+     *   <li><b>Rank clamp</b>: a warming-up peer below the cap whose bare rank is below the lowest
+     *       warm peer's rank is clamped up to that lowest warm rank, so it ties with the best
+     *       warm peer (~50/50 via comparator tie-break + shuffle) instead of looking fastest from
+     *       sparse stats.</li>
+     * </ul>
+     * Once a peer's observation count reaches the threshold both protections release, and it ranks
+     * on standard C3 terms.
      *
      * @param nodeStats        per-node EWMA stats; {@code Optional.empty()} for nodes without stats
      * @param snapshotCounts   mutable snapshot of in-flight counts used by the ARS formula and
      *                         local multi-shard spreading
      * @param liveCounts       live (real-time) in-flight counts for the probe cap check
-     * @param probeInflightCap maximum number of concurrent in-flight requests to a stat-less node
-     *                         before it stops being probed
-     * @return map of node ID to computed rank; nodes above the probe cap with no stats are absent
+     * @param probeInflightCap maximum number of concurrent in-flight requests to a stat-less or
+     *                         warming-up node before the in-flight gate kicks in
+     * @param warmupSamples    minimum observation count for a peer to be considered warm; {@code 0}
+     *                         disables both warmup protections (clamp and in-flight gate during warmup)
+     * @return map of node ID to computed rank; nodes above the in-flight cap with sparse stats are absent
      */
     static Map<String, Double> rankNodes(
         final Map<String, Optional<ResponseCollectorService.ComputedNodeStats>> nodeStats,
         final Map<String, Long> snapshotCounts,
         final Map<String, Long> liveCounts,
-        final long probeInflightCap
+        final long probeInflightCap,
+        final int warmupSamples
     ) {
         final Map<String, Double> nodeRanks = Maps.newMapWithExpectedSize(nodeStats.size());
         List<String> probeCandidates = null;
-        double bestRank = Double.POSITIVE_INFINITY;
+        List<String> warmingUpRanked = null;
+        double bestPeerRank = Double.POSITIVE_INFINITY;
+        double bestWarmRank = Double.POSITIVE_INFINITY;
+
         for (Map.Entry<String, Optional<ResponseCollectorService.ComputedNodeStats>> entry : nodeStats.entrySet()) {
-            Optional<ResponseCollectorService.ComputedNodeStats> maybeStats = entry.getValue();
-            if (maybeStats.isPresent()) {
-                final String nodeId = entry.getKey();
-                double rank = maybeStats.get().rank(snapshotCounts.getOrDefault(nodeId, 0L));
-                nodeRanks.put(nodeId, rank);
-                if (rank < bestRank) {
-                    bestRank = rank;
-                }
-            } else {
-                final String nodeId = entry.getKey();
-                // Check snapshot first (cheap HashMap read) — if already at cap from
-                // within-search shard wins, skip the live map lookup (volatile ConcurrentHashMap read).
-                long snapshotCount = snapshotCounts.getOrDefault(nodeId, 0L);
+            final String nodeId = entry.getKey();
+            final Optional<ResponseCollectorService.ComputedNodeStats> maybeStats = entry.getValue();
+            final long snapshotCount = snapshotCounts.getOrDefault(nodeId, 0L);
+
+            if (maybeStats.isEmpty()) {
+                // Stat-less: probe ahead of measured peers if below the cap, otherwise skip and
+                // sort last via nullsLast.
                 if (snapshotCount < probeInflightCap && liveCounts.getOrDefault(nodeId, 0L) < probeInflightCap) {
-                    // No stats and below both caps — candidate for probing
                     if (probeCandidates == null) {
                         probeCandidates = new ArrayList<>();
                     }
                     probeCandidates.add(nodeId);
                 }
+                continue;
             }
-            // Nodes without stats at or above the cap already have enough probes in flight;
-            // they get no rank entry and sort last via nullsLast.
+
+            final ResponseCollectorService.ComputedNodeStats stats = maybeStats.get();
+            final boolean warmingUp = warmupSamples > 0 && stats.observationCount < warmupSamples;
+
+            // Warming-up peers obey the same in-flight cap as stat-less probes. At-or-above the
+            // cap they get no rank entry and sort last via nullsLast, hard-capping the burst load
+            // a sparsely measured node can absorb before it has graduated to warm.
+            if (warmingUp) {
+                if (probeInflightCap > 0
+                    && (snapshotCount >= probeInflightCap || liveCounts.getOrDefault(nodeId, 0L) >= probeInflightCap)) {
+                    continue;
+                }
+                if (warmingUpRanked == null) {
+                    warmingUpRanked = new ArrayList<>();
+                }
+                warmingUpRanked.add(nodeId);
+            }
+
+            final double bare = stats.rank(snapshotCount);
+            nodeRanks.put(nodeId, bare);
+
+            // bestPeerRank tracks the lowest bare rank across all peers; bestWarmRank tracks the
+            // lowest among warm peers only.
+            if (bare < bestPeerRank) {
+                bestPeerRank = bare;
+            }
+            if (warmingUp == false && bare < bestWarmRank) {
+                bestWarmRank = bare;
+            }
         }
 
-        // Assign probe candidates just ahead of the best known rank so they receive traffic
+        // Clamp warming-up peers up to the best warm peer's rank so they tie with it (~50/50 via
+        // the comparator's tie-break) instead of looking fastest from sparse stats.
+        if (warmingUpRanked != null && bestWarmRank != Double.POSITIVE_INFINITY) {
+            for (String nodeId : warmingUpRanked) {
+                if (nodeRanks.get(nodeId) < bestWarmRank) {
+                    nodeRanks.put(nodeId, bestWarmRank);
+                }
+            }
+        }
+
+        // Place stat-less probe candidates just ahead of the best known rank.
         if (probeCandidates != null && nodeRanks.isEmpty() == false) {
+            final double probeRank = Math.nextDown(bestPeerRank);
             for (String nodeId : probeCandidates) {
-                nodeRanks.put(nodeId, Math.nextDown(bestRank));
+                nodeRanks.put(nodeId, probeRank);
             }
         }
         return nodeRanks;
     }
 
     /**
-     * Adjust the for all other nodes' collected stats. In the original ranking paper there is no need to adjust other nodes' stats because
+     * Adjust all other nodes' collected stats. In the original ranking paper there is no need to adjust other nodes' stats because
      * Cassandra sends occasional requests to all copies of the data, so their stats will be updated during that broadcast phase. In
      * Elasticsearch, however, we do not have that sort of broadcast-to-all behavior. In order to prevent a node that gets a high score and
      * then never gets any more requests, we must ensure it eventually returns to a more normal score and can be a candidate for serving
@@ -402,13 +457,17 @@ public class IndexShardRoutingTable {
         // Retrieve which nodes we can potentially send the query to
         final Map<String, Optional<ResponseCollectorService.ComputedNodeStats>> nodeStats = getNodeStats(shards, collector);
 
+        // Warmup smoothing only applies when probing is on (the gate creates the cold→warm
+        // transition the smoothing is designed to bridge). With probing off, behavior is unchanged.
+        final int warmupSamples = ARS_PROBING_FEATURE_FLAG.isEnabled() ? arsContext.warmupSamples() : 0;
+
         // sort all shards based on the shard rank
         ArrayList<ShardRouting> sortedShards = new ArrayList<>(shards);
-        sortedShards.sort(new NodeRankComparator(rankNodes(nodeStats, snapshotCounts, liveCounts, PROBE_INFLIGHT_CAP)));
+        sortedShards.sort(new NodeRankComparator(rankNodes(nodeStats, snapshotCounts, liveCounts, PROBE_INFLIGHT_CAP, warmupSamples)));
 
         // Blend the winner's stats into non-winner nodes so their stale EWMA values
         // gradually converge toward the winner's, preventing permanent starvation.
-        ShardRouting minShard = sortedShards.get(0);
+        ShardRouting minShard = sortedShards.getFirst();
         // If the winning shard is not started we are ranking initializing
         // shards, don't bother to do adjustments
         if (minShard.started()) {
@@ -421,9 +480,7 @@ public class IndexShardRoutingTable {
             // making the probe cap effective for multi-shard indices.
             snapshotCounts.compute(minNodeId, (id, conns) -> conns == null ? 1 : conns + 1);
             Optional<ResponseCollectorService.ComputedNodeStats> maybeMinStats = nodeStats.get(minNodeId);
-            if (maybeMinStats.isPresent()) {
-                adjustStats(collector, nodeStats, minNodeId, maybeMinStats.get());
-            }
+            maybeMinStats.ifPresent(computedNodeStats -> adjustStats(collector, nodeStats, minNodeId, computedNodeStats));
         }
 
         return sortedShards;

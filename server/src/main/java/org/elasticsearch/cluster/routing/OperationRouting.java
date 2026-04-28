@@ -44,8 +44,16 @@ public class OperationRouting {
      *                         incremented locally for multi-shard spreading within a single search
      * @param liveCounts       read-only live view of in-flight counts, used by the probe cap to
      *                         see real concurrent load across searches
+     * @param warmupSamples    minimum observation count for a peer to be considered warm; below
+     *                         this threshold a peer is subject to the in-flight cap and the rank
+     *                         clamp; {@code 0} disables both warmup protections
      */
-    public record ArsContext(ResponseCollectorService collector, Map<String, Long> snapshotCounts, Map<String, Long> liveCounts) {}
+    public record ArsContext(
+        ResponseCollectorService collector,
+        Map<String, Long> snapshotCounts,
+        Map<String, Long> liveCounts,
+        int warmupSamples
+    ) {}
 
     public static final Setting<Boolean> USE_ADAPTIVE_REPLICA_SELECTION_SETTING = Setting.boolSetting(
         "cluster.routing.use_adaptive_replica_selection",
@@ -54,16 +62,55 @@ public class OperationRouting {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Minimum observation count for a peer to be considered warm. Below this threshold a peer is
+     * <em>warming up</em> and is subject to two protections in the ARS routing decision: the same
+     * in-flight cap as stat-less probes ({@code PROBE_INFLIGHT_CAP}) and a rank clamp that pegs
+     * its rank to the lowest warm peer's rank. Once a peer's observation count reaches the
+     * threshold both protections release and the peer ranks on standard C3 terms.
+     * <p>
+     * Higher values keep a freshly probed node under the cap and clamp longer, giving its EWMA
+     * stats more time to converge under sustained load before full participation. The default is
+     * sized so that, at typical request rates, a node has experienced several rounds of cap
+     * saturation before graduating — by which point its bare rank reflects real, not light-probe,
+     * performance.
+     * <p>
+     * Internal tuning surface — not advertised in user docs; {@code 0} disables both warmup
+     * protections.
+     */
+    public static final Setting<Integer> ADAPTIVE_REPLICA_SELECTION_WARMUP_SAMPLES_SETTING = Setting.intSetting(
+        "cluster.routing.use_adaptive_replica_selection.warmup_samples",
+        1000,
+        0,
+        10000,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private boolean useAdaptiveReplicaSelection;
+    private volatile int adaptiveReplicaSelectionWarmupSamples;
 
     @SuppressWarnings("this-escape")
     public OperationRouting(Settings settings, ClusterSettings clusterSettings) {
         this.useAdaptiveReplicaSelection = USE_ADAPTIVE_REPLICA_SELECTION_SETTING.get(settings);
+        this.adaptiveReplicaSelectionWarmupSamples = ADAPTIVE_REPLICA_SELECTION_WARMUP_SAMPLES_SETTING.get(settings);
         clusterSettings.addSettingsUpdateConsumer(USE_ADAPTIVE_REPLICA_SELECTION_SETTING, this::setUseAdaptiveReplicaSelection);
+        clusterSettings.addSettingsUpdateConsumer(
+            ADAPTIVE_REPLICA_SELECTION_WARMUP_SAMPLES_SETTING,
+            this::setAdaptiveReplicaSelectionWarmupSamples
+        );
     }
 
     void setUseAdaptiveReplicaSelection(boolean useAdaptiveReplicaSelection) {
         this.useAdaptiveReplicaSelection = useAdaptiveReplicaSelection;
+    }
+
+    void setAdaptiveReplicaSelectionWarmupSamples(int adaptiveReplicaSelectionWarmupSamples) {
+        this.adaptiveReplicaSelectionWarmupSamples = adaptiveReplicaSelectionWarmupSamples;
+    }
+
+    public int getAdaptiveReplicaSelectionWarmupSamples() {
+        return adaptiveReplicaSelectionWarmupSamples;
     }
 
     /**
