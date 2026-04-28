@@ -103,21 +103,27 @@ public class SearchReplicaSelectionIT extends ESIntegTestCase {
 
     /**
      * Verifies that when a new node joins a cluster that already has ARS stats, the probe cap
-     * bounds how many shards the new node wins within a single search. Uses a multi-shard index
-     * so that rankShardsAndUpdateStats is called once per shard and the local nodeSearchCounts
-     * increment triggers the cap.
+     * bounds how many shards the new node wins within a single search. Uses an index whose shard
+     * count exceeds {@code PROBE_INFLIGHT_CAP} so that the cap meaningfully constrains: the local
+     * snapshotCounts increment per shard win triggers the cap once shard wins on the new node
+     * reach the cap, after which the new node sorts last via nullsLast for the remaining shards.
      */
     public void testNewNodeProbedButNotFlooded() {
         Client client = internalCluster().coordOnlyNodeClient();
 
-        // 10 shards, 2 replicas across the initial 3 data nodes
-        client.admin().indices().prepareCreate("probe_test").setSettings(indexSettings(10, 2)).get();
+        // PROBE_INFLIGHT_CAP is 50 when the ars_probing feature flag is enabled. Use a shard
+        // count that exceeds the cap so the cap actually bites. Mirrored locally rather than
+        // referenced from IndexShardRoutingTable because the constant is package-private.
+        final int probeCap = 50;
+        final int shardCount = probeCap + 10;
+
+        client.admin().indices().prepareCreate("probe_test").setSettings(indexSettings(shardCount, 2)).get();
         ensureGreen("probe_test");
 
         // Index documents so that most shards have at least one hit. Not all shards are guaranteed
         // to have a document, but that only undercounts the new node's shards — making the
         // assertion more lenient, not flaky.
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < shardCount * 10; i++) {
             client.prepareIndex("probe_test").setSource("field", "value" + i).get();
         }
         refresh("probe_test");
@@ -145,19 +151,17 @@ public class SearchReplicaSelectionIT extends ESIntegTestCase {
         }
         assertNotNull("new node should be in cluster state", newNodeId);
 
-        // Send a search requesting all hits and count how many distinct shards were routed to
-        // the new node. With 10 shards and a probe cap of 8, the new node should win at most
-        // 8 shards within a single search before the local nodeSearchCounts increment triggers
-        // the cap.
+        // Send a search requesting hits from every shard and count how many distinct shards were
+        // routed to the new node. The new node should win at most probeCap shards within a single
+        // search before the snapshotCounts increment triggers the cap.
         final String targetNodeId = newNodeId;
-        assertResponse(client.prepareSearch("probe_test").setQuery(matchAllQuery()).setSize(100), response -> {
+        assertResponse(client.prepareSearch("probe_test").setQuery(matchAllQuery()).setSize(shardCount * 10), response -> {
             long newNodeShards = java.util.Arrays.stream(response.getHits().getHits())
                 .filter(hit -> targetNodeId.equals(hit.getShard().getNodeId()))
                 .map(hit -> hit.getShard().getShardId())
                 .distinct()
                 .count();
-            // PROBE_INFLIGHT_CAP is 8 when the ars_probing feature flag is enabled
-            assertThat("new node should not win more shards than the probe cap", newNodeShards, lessThanOrEqualTo(8L));
+            assertThat("new node should not win more shards than the probe cap", newNodeShards, lessThanOrEqualTo((long) probeCap));
         });
     }
 
