@@ -264,9 +264,6 @@ tests:
 - class: org.elasticsearch.xpack.prometheus.PrometheusMetadataRestIT
   method: testMultipleEntriesForSameMetricAcrossStreams
   issue: https://github.com/elastic/elasticsearch/issues/147170
-- class: org.elasticsearch.xpack.security.operator.OperatorPrivilegesIT
-  method: testNonOperatorUserCanCallAnalyzeRepositoryAPI
-  issue: https://github.com/elastic/elasticsearch/issues/147171
 - class: org.elasticsearch.backwards.MixedClusterClientYamlTestSuiteIT
   method: test {p0=index/100_field_name_length_limit/Test field name length limit array}
   issue: https://github.com/elastic/elasticsearch/issues/147205
@@ -336,9 +333,6 @@ tests:
 - class: org.elasticsearch.multiproject.test.CoreWithMultipleProjectsClientYamlTestSuiteIT
   method: test {yaml=reindex/10_basic/Response format for version conflict with conflicts=proceed}
   issue: https://github.com/elastic/elasticsearch/issues/147594
-- class: org.elasticsearch.xpack.esql.qa.single_node.GenerativeRandomMappingIT
-  method: test
-  issue: https://github.com/elastic/elasticsearch/issues/147610
 - class: org.elasticsearch.xpack.esql.qa.single_node.EsqlSpecForceStoredLoadingIT
   method: test {csv-spec:fuse.fuseWithRowLinearAndMultiValueGroupColumn}
   issue: https://github.com/elastic/elasticsearch/issues/147613
@@ -406,6 +400,9 @@ tests:
 - class: org.elasticsearch.search.runtime.GeoPointScriptFieldExistsQueryTests
   method: testEqualsAndHashCode
   issue: https://github.com/elastic/elasticsearch/issues/147778
+- class: org.elasticsearch.search.rescore.QueryRescoreModeTests
+  method: testQueryRescoreMode
+  issue: https://github.com/elastic/elasticsearch/issues/147812
 
 # Examples:
 #
