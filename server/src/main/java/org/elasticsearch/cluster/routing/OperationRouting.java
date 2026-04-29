@@ -65,7 +65,7 @@ public class OperationRouting {
     /**
      * Minimum observation count for a peer to be considered warm. Below this threshold a peer is
      * <em>warming up</em> and is subject to two protections in the ARS routing decision: the same
-     * in-flight cap as stat-less probes ({@code PROBE_INFLIGHT_CAP}) and a rank clamp that pegs
+     * in-flight cap as stat-less probes ({@link IndexShardRoutingTable#PROBE_INFLIGHT_CAP}) and a rank clamp that pegs
      * its rank to the lowest warm peer's rank. Once a peer's observation count reaches the
      * threshold both protections release and the peer ranks on standard C3 terms.
      * <p>
@@ -80,7 +80,7 @@ public class OperationRouting {
      */
     public static final Setting<Integer> ADAPTIVE_REPLICA_SELECTION_WARMUP_SAMPLES_SETTING = Setting.intSetting(
         "cluster.routing.use_adaptive_replica_selection.warmup_samples",
-        1000,
+        100,
         0,
         10000,
         Setting.Property.Dynamic,

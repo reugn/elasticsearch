@@ -290,7 +290,7 @@ public class IndexShardRoutingTable {
      * while the node builds EWMA stats from its first completed requests. Set to 0 (disabled)
      * when the feature flag is off.
      */
-    static final long PROBE_INFLIGHT_CAP = ARS_PROBING_FEATURE_FLAG.isEnabled() ? 50 : 0;
+    public static final long PROBE_INFLIGHT_CAP = ARS_PROBING_FEATURE_FLAG.isEnabled() ? 2 : 0;
 
     /**
      * Computes a rank for each node based on its adaptive replica selection (ARS) stats.

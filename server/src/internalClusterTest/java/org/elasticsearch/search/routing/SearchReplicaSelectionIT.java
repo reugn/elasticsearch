@@ -17,6 +17,7 @@ import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
 import org.elasticsearch.cluster.routing.OperationRouting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.test.ESIntegTestCase;
@@ -104,18 +105,16 @@ public class SearchReplicaSelectionIT extends ESIntegTestCase {
     /**
      * Verifies that when a new node joins a cluster that already has ARS stats, the probe cap
      * bounds how many shards the new node wins within a single search. Uses an index whose shard
-     * count exceeds {@code PROBE_INFLIGHT_CAP} so that the cap meaningfully constrains: the local
-     * snapshotCounts increment per shard win triggers the cap once shard wins on the new node
-     * reach the cap, after which the new node sorts last via nullsLast for the remaining shards.
+     * count exceeds {@link IndexShardRoutingTable#PROBE_INFLIGHT_CAP} so that the cap meaningfully
+     * constrains: the local snapshotCounts increment per shard win triggers the cap once shard
+     * wins on the new node reach the cap, after which the new node sorts last via nullsLast for
+     * the remaining shards.
      */
     public void testNewNodeProbedButNotFlooded() {
         Client client = internalCluster().coordOnlyNodeClient();
 
-        // PROBE_INFLIGHT_CAP is 50 when the ars_probing feature flag is enabled. Use a shard
-        // count that exceeds the cap so the cap actually bites. Mirrored locally rather than
-        // referenced from IndexShardRoutingTable because the constant is package-private.
-        final int probeCap = 50;
-        final int shardCount = probeCap + 10;
+        final long probeCap = IndexShardRoutingTable.PROBE_INFLIGHT_CAP;
+        final int shardCount = (int) probeCap + 10;
 
         client.admin().indices().prepareCreate("probe_test").setSettings(indexSettings(shardCount, 2)).get();
         ensureGreen("probe_test");
@@ -161,7 +160,7 @@ public class SearchReplicaSelectionIT extends ESIntegTestCase {
                 .map(hit -> hit.getShard().getShardId())
                 .distinct()
                 .count();
-            assertThat("new node should not win more shards than the probe cap", newNodeShards, lessThanOrEqualTo((long) probeCap));
+            assertThat("new node should not win more shards than the probe cap", newNodeShards, lessThanOrEqualTo(probeCap));
         });
     }
 
