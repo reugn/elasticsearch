@@ -2265,7 +2265,13 @@ public class SearchServiceSingleNodeTests extends ESSingleNodeTestCase {
         createIndex("index");
         SearchService searchService = getInstanceFromNode(SearchService.class);
         PlainActionFuture<ShardSearchContextId> future = new PlainActionFuture<>();
-        searchService.openReaderContext(new ShardId(resolveIndex("index"), 0), TimeValue.timeValueMinutes(between(1, 10)), null, future);
+        searchService.openReaderContext(
+            new ShardId(resolveIndex("index"), 0),
+            TimeValue.timeValueMinutes(between(1, 10)),
+            null,
+            SplitShardCountSummary.IRRELEVANT,
+            future
+        );
         future.actionGet();
         assertThat(searchService.getActiveContexts(), equalTo(1));
         assertTrue(searchService.freeReaderContext(future.actionGet()));
