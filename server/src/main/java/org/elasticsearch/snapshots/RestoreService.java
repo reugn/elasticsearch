@@ -74,6 +74,7 @@ import org.elasticsearch.index.IndexSortConfig;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.Mapping;
+import org.elasticsearch.index.seqno.SequenceNumbers;
 import org.elasticsearch.index.shard.IndexLongFieldRange;
 import org.elasticsearch.index.shard.IndexShard;
 import org.elasticsearch.index.shard.ShardId;
@@ -525,6 +526,8 @@ public final class RestoreService implements ClusterStateApplier {
             projectBuilder = ProjectMetadata.builder(projectId);
             metadataBuilder.put(projectBuilder);
         }
+        final IndexVersion minIndexCompatibilityVersion = clusterService.state().getNodes().getMinSupportedIndexVersion();
+        final IndexVersion minReadOnlyIndexCompatibilityVersion = clusterService.state().getNodes().getMinReadOnlySupportedIndexVersion();
         for (IndexId indexId : repositoryData.resolveIndices(requestedIndicesIncludingSystem).values()) {
             IndexMetadata snapshotIndexMetaData = repository.getSnapshotIndexMetaData(repositoryData, snapshotId, indexId);
             // Update the snapshot index metadata before adding it to the metadata
@@ -534,6 +537,14 @@ public final class RestoreService implements ClusterStateApplier {
                     explicitlyRequestedSystemIndices.add(indexId.getName());
                 }
             }
+            verifyReadOnlyRestoreSafety(
+                repository,
+                snapshot,
+                indexId,
+                snapshotIndexMetaData,
+                minIndexCompatibilityVersion,
+                minReadOnlyIndexCompatibilityVersion
+            );
             projectBuilder.put(snapshotIndexMetaData, false);
         }
 
@@ -1804,13 +1815,81 @@ public final class RestoreService implements ClusterStateApplier {
     }
 
     /**
+     * Verifies that a read-only compatible index in a snapshot was quiesced when the snapshot was taken — i.e. every shard's
+     * Lucene commit has {@code local_checkpoint == max_seq_no}. This is the same invariant the add-block API enforces during
+     * a normal N-1 upgrade, and is required to safely auto-mark the restored index as {@code verified_read_only}.
+     * <p>
+     * Skipped for indices that don't need auto-marking (already verified, fully supported, or legacy — the latter goes
+     * through {@link #convertLegacyIndex}). Throws {@link SnapshotRestoreException} on any violation, including when the
+     * repository can't be inspected (non-blob-store) or when shard userdata can't be read.
+     */
+    static void verifyReadOnlyRestoreSafety(
+        Repository repository,
+        Snapshot snapshot,
+        IndexId indexId,
+        IndexMetadata indexMetadata,
+        IndexVersion minIndexCompatibilityVersion,
+        IndexVersion minReadOnlyIndexCompatibilityVersion
+    ) {
+        if (indexMetadata.getCompatibilityVersion().isLegacyIndexVersion()
+            || MetadataIndexStateService.VERIFIED_READ_ONLY_SETTING.get(indexMetadata.getSettings())
+            || IndexMetadataVerifier.isFullySupportedVersion(indexMetadata, minIndexCompatibilityVersion)
+            || IndexMetadataVerifier.isReadOnlyCompatible(
+                indexMetadata,
+                minIndexCompatibilityVersion,
+                minReadOnlyIndexCompatibilityVersion
+            ) == false) {
+            return;
+        }
+        if (repository instanceof BlobStoreRepository == false) {
+            throw new SnapshotRestoreException(
+                snapshot,
+                "cannot verify read-only restore safety for index ["
+                    + indexId.getName()
+                    + "]: snapshot commit userdata can only be inspected on blob-store repositories"
+            );
+        }
+        final BlobStoreRepository blobStoreRepository = (BlobStoreRepository) repository;
+        final int numberOfShards = indexMetadata.getNumberOfShards();
+        for (int shardId = 0; shardId < numberOfShards; shardId++) {
+            final SequenceNumbers.CommitInfo commitInfo;
+            try {
+                commitInfo = blobStoreRepository.loadShardSnapshotCommitInfo(indexId, shardId, snapshot.getSnapshotId());
+            } catch (Exception e) {
+                throw new SnapshotRestoreException(
+                    snapshot,
+                    "failed to read commit userdata for shard [" + shardId + "] of index [" + indexId.getName() + "]",
+                    e
+                );
+            }
+            if (commitInfo.localCheckpoint() != commitInfo.maxSeqNo()) {
+                throw new SnapshotRestoreException(
+                    snapshot,
+                    "cannot restore index ["
+                        + indexId.getName()
+                        + "] read-only: shard ["
+                        + shardId
+                        + "] was not quiesced when the snapshot was taken (local_checkpoint=["
+                        + commitInfo.localCheckpoint()
+                        + "], max_seq_no=["
+                        + commitInfo.maxSeqNo()
+                        + "]). To restore from this snapshot, restore it on a cluster running a version that fully supports "
+                        + "the source index, mark the index read-only via the add-index-block API, take a new snapshot, and "
+                        + "then restore that on this cluster."
+                );
+            }
+        }
+    }
+
+    /**
      * Prepares a read-only compatible index for restoration by automatically adding the write block and marking it as
      * verified read-only. This handles the case where a snapshot was created on an older version (e.g. 7.x) without
      * going through the intermediate upgrade step (e.g. 8.x) that would normally set these flags via the add-block API.
      * <p>
      * Only applies when the index is read-only compatible (e.g. created in version N-2) but not yet marked as verified.
      * Indices that already have the {@code verified_read_only} setting (from a proper upgrade) or that are fully
-     * compatible are left unchanged.
+     * compatible are left unchanged. Callers must have already verified per-shard quiescence via
+     * {@link #verifyReadOnlyRestoreSafety}.
      */
     static IndexMetadata prepareForReadOnlyRestore(
         IndexMetadata indexMetadata,
